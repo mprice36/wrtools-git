@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+#HELP:COMMAND_NAME: Generate index.md files for a git repo
+#HELP:Usage: COMMAND_NAME [options]*
+#HELP:Options:
+#HELP:  --help | -h: print this help
+#HELP:  --verbose | -v: print debugging and status output
+  #HELP:  --keep-temps | -k: Don't delete temporary files
+
+set -o nounset -o errexit -o pipefail
+export LC_ALL=C
+unset CDPATH
+
+root_dir=$(dirname "$0")/..
+. "$root_dir"/share/wrtools-core/opt_help.bash
+. "$root_dir"/share/wrtools-core/opt_verbose.bash
+. "$root_dir"/share/wrtools-core/fail.bash
+. "$root_dir"/share/wrtools-core/temp.bash
+
+#HELP:  -i: index: reference index.html in a subdirectory, rather than the directory itself
+unset index
+#HELP:  -r: recurse: list files in subdirectories, as well as local files
+unset recurse
+#HELP:  -s: subdirs: create index files in subdirectories, just locally
+unset subdirs
+
+OPTIND=1
+while getopts :hikrsv-: OPTION
+do
+    case "$OPTION" in
+        h ) opt_help;;
+        i ) index=true;;
+        k ) opt_keep_temps;;
+        r ) recurse=true;;
+        s ) subdirs=true;;
+        v ) opt_verbose;;
+        - )
+            case "$OPTARG" in
+                help ) opt_help;;
+                help=* ) fail_arg_unexpected "$OPTARG";;
+                keep-temps ) opt_keep_temps;;
+                keep-temps=* ) fail_arg_unexpected "$OPTARG";;
+                verbose ) opt_verbose;;
+                verbose=* ) fail_arg_unexpected "$OPTARG";;
+                * ) fail_option_unknown "$OPTARG";;
+            esac;;
+        '?' ) fail_option_unknown "$OPTARG";;
+        : ) fail_option_missing "$OPTARG";;
+        * ) fail "bad state OPTION=$OPTION";;
+    esac
+done
+shift $((OPTIND-1))
+
+(( $# == 0 )) || fail "Expected 0 arguments. Got $#."
+
+temp_make_file index_html
+
+# works in the current directory
+get_index_text () {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+  <head>
+    <style type="text/css" media="all">
+body {
+  font-family: Helvetica, Arial, sans-serif;
+  font-size: 12pt;
+}          
+p.title {
+  font-size: 18pt;
+}
+:any-link {
+  color: black;
+  text-decoration: none;
+}
+:any-link:hover {
+  background-color: LightYellow;
+}
+    </style>
+    <title>Index</title>
+  </head>
+  <body>
+    <p class="title">Index</title>
+    <ul>
+EOF
+
+if [[ ${recurse-} = true ]]
+then find -s . -type f ! -path '*/.git/*' -print0
+else find -s . -maxdepth 1 ! -path '.' ! -path '*/.git' ! -path '*/.git/*' -print0
+fi \
+  | sed -z -e 's/^..//' \
+  | while read -r -d '' path
+do 
+    if [[ -d $path ]]
+    then if [[ ${index-} = true ]]
+         then printf '<li><a href="%s/index.html">%s</a></li>\n' "$path" "$path"
+         else printf '<li><a href="%s">%s</a></li>\n' "$path" "$path"
+         fi
+    else printf '<li><a href="%s">%s</a></li>\n' "$path" "$path"
+    fi
+done
+
+cat <<EOF
+    </ul>
+  </body>
+</html>
+EOF
+}
+
+# call as: generate_index $dir
+# call as: generate_index .
+# call as: generate_index ./foo/bar/baz
+generate_index () {
+    pushd "$1" > /dev/null || fail "Can't change current directory to $1"
+    if [[ -e index.html ]]
+    then printf 'Warning:index.html already exists in %s\n' "$1" >&2
+    else get_index_text > "$index_html"
+         # prevent the index from showing up in the index.
+         cat "$index_html" > index.html
+    fi
+    popd > /dev/null
+}
+
+while read -r -d ''
+do generate_index "$REPLY"
+done < <(if [[ ${subdirs-} = true ]]
+         then find -s . -type d ! -path '*/.git' ! -path '*/.git/*' -print0
+         else printf '.\0'
+         fi)

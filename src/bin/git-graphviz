@@ -8,6 +8,7 @@
 #HELP:  --keep-temps | -k: Don't delete temporary files
 
 set -o nounset -o errexit
+export LC_ALL=C
 
 root_dir=$(dirname "$0")/..
 . "$root_dir"/share/wrtools-core/opt_help.bash
@@ -15,13 +16,13 @@ root_dir=$(dirname "$0")/..
 . "$root_dir"/share/wrtools-core/fail.bash
 . "$root_dir"/share/wrtools-core/temp.bash
 
-#HELP:  --url-at-remote=$remote-name | -u $remote-name: point commits to URLs based on
-#HELP:                                                  a remote repo
-unset url_at_remote
-opt_url_at_remote () {
+#HELP:  --remote=$remote-name | -r $remote-name: point commits to URLs based on
+#HELP:                                           a remote repo
+unset remote
+opt_remote () {
     (( $# == 1 ))|| fail_assert "$FUNCNAME expects 1 arg, a remote name"
-    [[ -z ${url_at_remote+is-set} ]] || fail "$Option --url-at-remote can only be used once"
-    url_at_remote=$1
+    [[ is-set != ${remote+is-set} ]] || fail "Option --remote can only be used once"
+    remote=$1
 }
 
 #HELP:  --all | -a: show all commits & refs in the repository
@@ -57,7 +58,7 @@ opt_date () {
 }
 
 OPTIND=1
-while getopts :adhkou:v-: OPTION
+while getopts :adhkor:v-: OPTION
 do
     case "$OPTION" in
         a ) opt_all;;
@@ -65,34 +66,41 @@ do
         h ) opt_help;;
         k ) opt_keep_temps;;
         o ) opt_open;;
-        u ) opt_url_at_remote "$OPTARG";;
+        r ) opt_remote "$OPTARG";;
         v ) opt_verbose;;
         - )
             case "$OPTARG" in
                 all ) opt_all;;
-                decorate ) opt_decorate;;
-                help ) opt_help;;
-                keep-temps ) opt_keep_temps;;
-                open ) opt_open;;
-                verbose ) opt_verbose;;
-                all=* | help=* | keep-temps=* | verbose=* | open=* ) 
-                    fail "No argument expected for long option \"${OPTARG%%=*}\"";;
-
+                all=* ) fail_arg_unexpected "$OPTARG";;
+                date ) fail_arg_missing "$OPTARG";;
                 date=* ) opt_date "${OPTARG#*=}";;
-                url-at-remote=* ) opt_url_at_remote "${OPTARG#*=}";;
-                url-at-remote | date )
-                    fail "Missing required argument for long option \"$OPTARG\"";;
-                
-                * ) fail "Unexpected long option \"$OPTARG\"";;
+                decorate ) opt_decorate;;
+                decorate=* ) fail_arg_unexpected "$OPTARG";;
+                help ) opt_help;;
+                help=* ) fail_arg_unexpected "$OPTARG";;
+                keep-temps ) opt_keep_temps;;
+                keep-temps=* ) fail_arg_unexpected "$OPTARG";;
+                open ) opt_open;;
+                open=* ) fail_arg_unexpected "$OPTARG";;
+                remote ) fail_arg_missing "$OPTARG";;
+                remote=* ) opt_remote "${OPTARG#*=}";;
+                verbose ) opt_verbose;;
+                verbose=* ) fail_arg_unexpected "$OPTARG";;
+                * ) fail_option_unknown "$OPTARG";;
             esac;;
-        '?' ) fail "Unknown short option \"$OPTARG\"";;
-        : ) fail "Short option \"$OPTARG\" missing argument";;
+        '?' ) fail_option_unknown "$OPTARG";;
+        : ) fail_arg_missing "$OPTARG";;
         * ) fail "bad state OPTARG=\"$OPTARG\"";;
     esac
 done
 shift $((OPTIND-1))
 
-# $@ is git args
+if ! git rev-parse > /dev/null 2>&1
+then fail "Not in a git repository"
+fi
+   
+
+# $@ is git log args
 
 if [[ true = ${all-false} ]]
 then set -- --full-history --all
@@ -106,73 +114,118 @@ fi
 
 temp_make_dir git_graphviz
 
-url_format="format:%H"
-if [[ -n ${url_at_remote+is-set} ]]
-then git remote show "$url_at_remote" > "$git_graphviz"/remote_show.txt || fail "Remote $url_at_remote not found"
-     sed -e 's/^  Fetch URL: \(.*\)$/\1/p;d' < "$git_graphviz"/remote_show.txt > "$git_graphviz"/remote_url.txt
-     remote_url=$(cat "$git_graphviz"/remote_url.txt)
-     if [[ $remote_url == https://github.com/* ]]
-     then printf -v url_format "%s/commit/%%H" "${remote_url%.git}"
-     else fail "I don't know how to render remote $remote_url"
-     fi
+if [[ is-set = ${remote+is-set} ]]
+then true
+elif remote=$(git config --get-regexp '^remote.[^.]*.url$' | sed -e '1s/^remote\.\([^\.]*\).url .*$/\1/p;d')
+then true
 fi
+vecho "remote is ${remote-unset}"
 
-omit_blank_lines () {
-    egrep -v '^$' || true
-}
+unset remote_url
+if remote_url=$(git config --get "remote.$remote.url")
+then true
+fi
+vecho "remote_url is ${remote_url-unset}"
 
+case ${remote_url-} in
+    https://github.com/* )
+        use_remote_url=${remote_url%.git}
+        # params: $1 = short hash; $2 = long hash; $3 = summary
+        render_node () {
+            printf "\"%s\" [tooltip=\"%s\",URL=\"$use_remote_url/commit/%s\"]\n" "$1" "$3" "$2"
+        }
+        ;;
+    * )
+        render_node () {
+            printf "\"%s\" [tooltip=\"%s\",]\n" "$1" "$3"
+        }
+        ;;
+esac
+   
 # commit objects with parent1 and parent2
-"${git_log[@]}" --format="commit %h parents %p" "$@" > "$git_graphviz"/commits-with-parents.txt
+# FORMAT: commit $commit i $parent-index parent $parent
+while read -r -a values
+do for ((parent = 1; parent < ${#values[@]}; ++parent))
+   do printf "commit %s i %d parent %s\n" "${values[0]}" "$parent" "${values[parent]}"
+   done
+done \
+  < <("${git_log[@]}" --format="%h %p" "$@") \
+  | sort -b > "$git_graphviz"/commits-parents.txt
+
 # commits with summary description
-"${git_log[@]}" --format="commit %h summary %cN <%cE> %cd %s" "$@" > "$git_graphviz"/commits-with-summaries.txt
+# commit $commit-abbrev long $commit-long summary $summary
+"${git_log[@]}" --format="commit %h long %H summary %cN <%cE> %cd %s" "$@" | sed -e 's/"/\\"/g' > "$git_graphviz"/commits-with-summaries.txt
+# all hashes in the graph, sorted
+cut -d ' ' -f 2 < "$git_graphviz"/commits-with-summaries.txt | sort -b > "$git_graphviz"/hashes.txt
 
+# filter down the parent-child relationship to only where both parent & child
+# are in the list of commits.
+#
 # sorting by commit, parent1, and parent2
-sort -k 2b,2 "$git_graphviz"/commits-with-parents.txt > "$git_graphviz"/commits-with-parents.by-commit.txt
-sort -k 4b,4 "$git_graphviz"/commits-with-parents.txt > "$git_graphviz"/commits-with-parents.by-parent-1.txt
-sort -k 5b,5 "$git_graphviz"/commits-with-parents.txt > "$git_graphviz"/commits-with-parents.by-parent-2.txt
-# get parent 1 and 2 where the parent is also in the list of commits
-join -1 4 -2 2 -o 1.1,1.2,1.3,1.4 "$git_graphviz"/commits-with-parents.by-parent-1.txt "$git_graphviz"/commits-with-parents.by-commit.txt > "$git_graphviz"/parent-1-to-commit.txt
-join -1 5 -2 2 -o 1.1,1.2,1.3,1.5 "$git_graphviz"/commits-with-parents.by-parent-2.txt "$git_graphviz"/commits-with-parents.by-commit.txt > "$git_graphviz"/parent-2-to-commit.txt
+sort -k 6b,6 "$git_graphviz"/commits-parents.txt > "$git_graphviz"/commits-parents.by-parent.txt
+# get parent where the parent is also in the list of commits
+# FORMAT: commit $commit i $parent-index parent $parent
+join -1 6 -2 1 -o 1.1,1.2,1.3,1.4,1.5,1.6 "$git_graphviz"/commits-parents.by-parent.txt "$git_graphviz"/hashes.txt > "$git_graphviz"/included-commits-parents.txt
 
+# decoration-style refs
 if [[ true = ${decorate-false} ]]
 then
-  # decoration-style refs
-  # "${git_log[@]}" --format="object %h refs %D" "$@" > "$git_graphviz"/refs.txt
-  # tags, each tag object with name and what it references
-  git for-each-ref --format="%(objecttype) %(objectname:short) name %(refname:short) references %(*objectname:short)" refs/tags > "$git_graphviz"/refs-tags.txt
-  # tag $tag-object-hash name $tag-name references $commit-object-hash
-  { egrep '^tag ' "$git_graphviz"/refs-tags.txt || true; } > "$git_graphviz"/tag-objects.txt
-  # name $tag-name references $commit-object-hash
-  sed '/^commit /s/^commit \([^ ]*\) name \([^ ]*\) references .*$/name \2 references \1/p;d' "$git_graphviz"/refs-tags.txt > "$git_graphviz"/lightweight-tags.txt
-  # name $ref-name references $commit-object-hash
-  git for-each-ref --format="name %(refname:short) references %(objectname:short)" refs/heads refs/remotes > "$git_graphviz"/references.txt
+  # # # # # # # # # # # # # # # # 
+  # all heavyweight tags
+  # FORMAT: tag $tag-object references $referenced-object
+  git for-each-ref --format="%(objecttype) %(objectname:short) references %(*objectname:short) summary %(taggername) %(taggeremail) %(taggerdate) %(contents:subject)" refs/tags | sed -e 's/"/\\"/g' -e '/^tag /p;d' > "$git_graphviz"/tag-objects.txt
+  sort -k 4b,4 "$git_graphviz"/tag-objects.txt > "$git_graphviz"/tag-objects.by-referenced-object.txt
+  sort -u -k 2b,2 "$git_graphviz"/tag-objects.txt > "$git_graphviz"/tag-objects.by-tag-object.txt
+
+  # tags can point to tags, so we have to iteratively add tags until none more
+  # get added
+  while true
+  do join -1 4 -2 1 -o 1.2 "$git_graphviz"/tag-objects.by-referenced-object.txt \
+          "$git_graphviz"/hashes.txt > "$git_graphviz"/joined.txt
+     cat "$git_graphviz"/joined.txt "$git_graphviz"/hashes.txt \
+       | sort -b -u > "$git_graphviz"/updated-hashes.txt
+     if diff -q "$git_graphviz"/hashes.txt "$git_graphviz"/updated-hashes.txt > /dev/null
+     then break
+     else mv "$git_graphviz"/updated-hashes.txt "$git_graphviz"/hashes.txt
+     fi
+  done
+  mv "$git_graphviz"/updated-hashes.txt "$git_graphviz"/hashes.txt
+
+  # join tag-object to hashes
+  # FORMAT: tag $tag-object references $referenced-object summary $summary...
+  join -1 2 -2 1 "$git_graphviz"/tag-objects.by-tag-object.txt "$git_graphviz"/hashes.txt > "$git_graphviz"/included-tag-objects.txt
+
+  # # # # # # # # # # # # # # # # 
+  # all lightweight tags
+  # FORMAT: name $tag-name references $referenced-object
+  git for-each-ref --format="name %(refname:short) references %(objectname:short)" refs/tags \
+    | sort -k 4b,4 > "$git_graphviz"/lightweight-tags.by-referenced-object.txt
+  # join referenced objects to hashes
+  # FORMAT: name $tag-name references $referenced-object
+  join -1 4 -2 1 -o 1.1,1.2,1.3,1.4 "$git_graphviz"/lightweight-tags.by-referenced-object.txt "$git_graphviz"/hashes.txt > "$git_graphviz"/included-lightweight-tags.txt
+
+  # # # # # # # # # # # # # # # # 
+  # all refs: all branches & remotes
+  # FORMAT: name $ref-name references $referenced-object
+  git for-each-ref --format="name %(refname:short) references %(objectname:short)" refs/heads refs/remotes | sort -k 4b,4 > "$git_graphviz"/refs.by-referenced-object.txt
+  # join refs.referenced-object to hashes
+  # FORMAT: name $ref-name references $referenced-object
+  join -1 4 -2 1 -o 1.1,1.2,1.3,1.4 "$git_graphviz"/refs.by-referenced-object.txt "$git_graphviz"/hashes.txt > "$git_graphviz"/included-refs.txt
+
+  # # # # # # # # # # # # # # # # 
+  # just the local HEAD
+  # FORMAT: $ref-name
   git rev-parse --abbrev-ref HEAD > "$git_graphviz"/head.txt
-
-  #############################################################################
-  # pick references (branches & remotes)
-  # sort references by referenced commit
-  sort -k 4b,4 "$git_graphviz"/references.txt > "$git_graphviz"/references.by-referenced-commit.txt
-  # join references to referenced commits
-  join -1 4 -2 2 -o 1.1,1.2,1.3,1.4 "$git_graphviz"/references.by-referenced-commit.txt "$git_graphviz"/commits-with-parents.by-commit.txt > "$git_graphviz"/reference-to-commit.txt
-
-  #############################################################################
-  # pick tags
-  sort -k 6b,6 "$git_graphviz"/tag-objects.txt > "$git_graphviz"/tag-objects.by-referenced-commit.txt
-  # join tags to referenced commits
-  join -1 6 -2 2 -o 1.1,1.2,1.3,1.4,1.5,1.6 "$git_graphviz"/tag-objects.by-referenced-commit.txt "$git_graphviz"/commits-with-parents.by-commit.txt > "$git_graphviz"/tag-to-commit.txt
-
-  #############################################################################
-  # pick lightweight tags
-  sort -k 4b,4 "$git_graphviz"/lightweight-tags.txt > "$git_graphviz"/lightweight-tags.by-referenced-commit.txt
-  # join tags to referenced commits
-  join -1 4 -2 2 -o 1.1,1.2,1.3,1.4 "$git_graphviz"/lightweight-tags.by-referenced-commit.txt "$git_graphviz"/commits-with-parents.by-commit.txt > "$git_graphviz"/lightweight-tag-to-commit.txt
-
-  #############################################################################
-  # pick HEAD
-  sort -k 2b,2 "$git_graphviz"/reference-to-commit.txt > "$git_graphviz"/reference-to-commit.by-name.txt
-  # join tags to referenced commits
-  join -1 1 -2 2 -o 2.1,2.2 "$git_graphviz"/head.txt "$git_graphviz"/reference-to-commit.by-name.txt > "$git_graphviz"/head-to-reference.txt
-
+  if [[ $(cat "$git_graphviz"/head.txt) == "HEAD" ]]
+  then # detached HEAD state. head is just a commit, not a branch.
+    git rev-parse --short HEAD > "$git_graphviz"/head.txt
+    join -1 1 -2 1 -o 1.1 "$git_graphviz"/head.txt "$git_graphviz"/hashes.txt > "$git_graphviz"/included-head.txt
+  else # HEAD points to a ref
+      # sort included refs by name
+      sort -k 2b,2 "$git_graphviz"/included-refs.txt > "$git_graphviz"/included-refs.by-name.txt
+      # FORMAT: $ref-name
+      join -1 1 -2 2 -o 1.1 "$git_graphviz"/head.txt "$git_graphviz"/included-refs.by-name.txt > "$git_graphviz"/included-head.txt
+  fi
 fi
 
 {
@@ -182,28 +235,37 @@ digraph git_graph {
     node [fontname = "Helvetica", fontsize = 10, width = 0, height = 0, shape=box, style=rounded];
 EOF
 
-    sed -e 's/"/\\"/g' -e 's/commit \([^ ]*\) summary \(.*\)$/"\1" [id="id_\1", tooltip="\2"];/' "$git_graphviz"/commits-with-summaries.txt
-    sed -e 's/commit \([^ ]*\) parents \(.*\)$/"\1" -> "\2";/' "$git_graphviz"/parent-1-to-commit.txt
-    sed -e 's/commit \([^ ]*\) parents \(.*\)$/"\1" -> "\2" [taillabel="2"];/' "$git_graphviz"/parent-2-to-commit.txt
-
+    # commit $commit-abbrev long $commit-long summary $summary...
+    while read -r L1 commit_abbrev L2 commit_long L3 summary
+    do render_node "$commit_abbrev" "$commit_long" "$summary"
+    done < "$git_graphviz"/commits-with-summaries.txt
+    
+    # FORMAT: commit $commit i $parent-index parent $parent
+    while read -r Lcommit commit Li parent_index Lparent parent
+    do
+        case $parent_index in
+            1 ) printf "\"%s\" -> \"%s\";\n" "$commit" "$parent";;
+            * ) printf "\"%s\" -> \"%s\" [taillabel=\"%s\"];\n" "$commit" "$parent" "$parent_index";;
+        esac
+    done < "$git_graphviz"/included-commits-parents.txt
+    
     if [[ true = ${decorate-false} ]]
     then
 
+
+      cat <<EOF
+node [shape=box, style=solid];
+EOF
+      
+      sed -e 's/\([^ ]*\) tag references \([^ ]*\) summary \(.*\)$/"\1" [label="tag:\1",tooltip="\3"];"\1" -> "\2";/p;d' "$git_graphviz"/included-tag-objects.txt
+      
       cat <<EOF
     node [shape=plaintext];
 EOF
 
-      sed -e 's/name \([^ ]*\) references \(.*\)$/"tag:\1" -> "\2";/' "$git_graphviz"/lightweight-tag-to-commit.txt
-      sed -e 's/name \([^ ]*\) references \(.*\)$/"\1" -> "\2";/' "$git_graphviz"/reference-to-commit.txt
-
-
-      cat <<EOF
-    node [shape=box, style=solid];
-EOF
-
-      sed -e 's/tag \([^ ]*\) name \([^ ]*\) references \(.*\)$/"\1" [label="tag:\2"];"\1" -> "\3";/' "$git_graphviz"/tag-to-commit.txt
-
-      sed -e 's/name \(.*\)$/"HEAD" [shape=plaintext];"HEAD" -> "\1";/' "$git_graphviz"/head-to-reference.txt
+      sed -e 's/name \([^ ]*\) references \(.*\)$/"tag:\1" -> "\2";/' "$git_graphviz"/included-lightweight-tags.txt
+      sed -e 's/name \([^ ]*\) references \(.*\)$/"\1" -> "\2";/' "$git_graphviz"/included-refs.txt
+      sed -e 's/^\(.*\)$/"HEAD" -> "\1";/' "$git_graphviz"/included-head.txt
 
     fi
     
